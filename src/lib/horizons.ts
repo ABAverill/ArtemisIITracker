@@ -36,11 +36,15 @@ function parseEarliestAvailable(result: string): Date | null {
   return isFinite(d.getTime()) ? d : null
 }
 
+/** Seconds after HORIZONS "prior to … TDB" time before START_TIME is accepted (first tabulated step is often ~1–2 min later). */
+const EARLIEST_EPHEM_BUFFER_SEC = 120
+
 async function fetchVectors(
   command: string,
   start: Date,
   stop: Date,
-  stepSize: string = '1m'
+  stepSize: string = '1m',
+  retryDepth: number = 0
 ): Promise<StateVector[]> {
   const effectiveStart = start > stop ? stop : start
   const effectiveStop = new Date(Math.max(stop.getTime(), effectiveStart.getTime() + 60_000))
@@ -68,12 +72,13 @@ async function fetchVectors(
   const json = await res.json()
   const result: string = json.result ?? ''
 
-  // If HORIZONS says data starts later, retry once from that time
+  // If HORIZONS says data starts later, retry from just past that boundary
   if (!result.includes('$$SOE')) {
     const earliest = parseEarliestAvailable(result)
-    if (earliest && isFinite(earliest.getTime())) {
-      const retryStop = new Date(earliest.getTime() + 10 * 60_000)
-      return fetchVectors(command, earliest, retryStop, stepSize)
+    if (earliest && isFinite(earliest.getTime()) && retryDepth < 4) {
+      const retryStart = new Date(earliest.getTime() + EARLIEST_EPHEM_BUFFER_SEC * 1000)
+      const retryStop = new Date(retryStart.getTime() + 10 * 60_000)
+      return fetchVectors(command, retryStart, retryStop, stepSize, retryDepth + 1)
     }
     return []
   }
@@ -91,27 +96,48 @@ function parseHorizonsCSV(text: string): StateVector[] {
 
   const vectors: StateVector[] = []
 
-  // HORIZONS CSV_FORMAT=YES with VEC_TABLE=2 outputs groups of 2 lines per epoch:
-  // Line 1: JDTDB, Calendar Date (TDB), X, Y, Z
-  // Line 2: VX, VY, VZ, LT, RG, RR
-  for (let i = 0; i + 1 < lines.length; i += 2) {
-    const cols1 = lines[i].split(',').map((s) => s.trim())
-    const cols2 = lines[i + 1].split(',').map((s) => s.trim())
+  // HORIZONS CSV_FORMAT=YES + VEC_TABLE=2 is usually one line per epoch:
+  //   JDTDB, Calendar Date (TDB), X, Y, Z, VX, VY, VZ, ...
+  // Some targets still use two lines (position then VX,VY,VZ,LT,RG,RR).
+  for (let i = 0; i < lines.length; i++) {
+    const cols = lines[i].split(',').map((s) => s.trim())
+    const jd = parseFloat(cols[0])
+    if (!Number.isFinite(jd) || jd < 2_400_000) continue
 
-    const jd = parseFloat(cols1[0])
-    const x = parseFloat(cols1[2])
-    const y = parseFloat(cols1[3])
-    const z = parseFloat(cols1[4])
-    const vx = parseFloat(cols2[0])
-    const vy = parseFloat(cols2[1])
-    const vz = parseFloat(cols2[2])
+    const x = parseFloat(cols[2])
+    const y = parseFloat(cols[3])
+    const z = parseFloat(cols[4])
+    if (![x, y, z].every(Number.isFinite)) continue
 
-    if (isNaN(jd) || isNaN(x)) continue
-
-    // JD to Unix ms: (JD - 2440587.5) * 86400 * 1000
     const unixMs = (jd - 2440587.5) * 86400 * 1000
     const time = new Date(unixMs).toISOString()
 
+    let vx: number
+    let vy: number
+    let vz: number
+
+    const inlineVel =
+      cols.length >= 8 &&
+      [cols[5], cols[6], cols[7]].every((c) => Number.isFinite(parseFloat(c)))
+
+    if (inlineVel) {
+      vx = parseFloat(cols[5])
+      vy = parseFloat(cols[6])
+      vz = parseFloat(cols[7])
+    } else {
+      const next = lines[i + 1]
+      if (!next) continue
+      const nc = next.split(',').map((s) => s.trim())
+      vx = parseFloat(nc[0])
+      vy = parseFloat(nc[1])
+      vz = parseFloat(nc[2])
+      if (![vx, vy, vz].every(Number.isFinite)) continue
+      // Next epoch lines start with ~2.46e6 JD; velocity km/s is much smaller.
+      if (Math.abs(vx) > 1_000_000) continue
+      i += 1
+    }
+
+    if (![vx, vy, vz].every(Number.isFinite)) continue
     vectors.push({ time, x, y, z, vx, vy, vz })
   }
 
